@@ -1,6 +1,6 @@
 import "@mariozechner/mini-lit/dist/ThemeToggle.js";
-import { Agent, type AgentMessage } from "@mariozechner/pi-agent-core";
-import { getModel } from "@mariozechner/pi-ai";
+import { Agent, type AgentEvent, type AgentMessage } from "@mariozechner/pi-agent-core";
+import { getModel, type TextContent } from "@mariozechner/pi-ai";
 import {
 	type AgentState,
 	ApiKeyPromptDialog,
@@ -13,11 +13,13 @@ import {
 	ProviderKeysStore,
 	ProvidersModelsTab,
 	ProxyTab,
+	type SandboxRuntimeProvider,
 	SessionListDialog,
 	SessionsStore,
 	SettingsDialog,
 	SettingsStore,
 	setAppStorage,
+	type UserMessageWithAttachments,
 } from "@mariozechner/pi-web-ui";
 import { html, render } from "lit";
 import { Bell, History, Plus, Settings } from "lucide";
@@ -69,9 +71,19 @@ let agent: Agent;
 let chatPanel: ChatPanel;
 let agentUnsubscribe: (() => void) | undefined;
 
+type UserChatMessage = Extract<AgentMessage, { role: "user" }> | UserMessageWithAttachments;
+
+function isUserChatMessage(message: AgentMessage): message is UserChatMessage {
+	return message.role === "user" || message.role === "user-with-attachments";
+}
+
+function isTextContent(content: { type: string }): content is TextContent {
+	return content.type === "text";
+}
+
 const generateTitle = (messages: AgentMessage[]): string => {
-	const firstUserMsg = messages.find((m) => m.role === "user" || m.role === "user-with-attachments");
-	if (!firstUserMsg || (firstUserMsg.role !== "user" && firstUserMsg.role !== "user-with-attachments")) return "";
+	const firstUserMsg = messages.find(isUserChatMessage);
+	if (!firstUserMsg) return "";
 
 	let text = "";
 	const content = firstUserMsg.content;
@@ -79,8 +91,8 @@ const generateTitle = (messages: AgentMessage[]): string => {
 	if (typeof content === "string") {
 		text = content;
 	} else {
-		const textBlocks = content.filter((c: any) => c.type === "text");
-		text = textBlocks.map((c: any) => c.text || "").join(" ");
+		const textBlocks = content.filter(isTextContent);
+		text = textBlocks.map((contentBlock) => contentBlock.text).join(" ");
 	}
 
 	text = text.trim();
@@ -94,8 +106,8 @@ const generateTitle = (messages: AgentMessage[]): string => {
 };
 
 const shouldSaveSession = (messages: AgentMessage[]): boolean => {
-	const hasUserMsg = messages.some((m: any) => m.role === "user" || m.role === "user-with-attachments");
-	const hasAssistantMsg = messages.some((m: any) => m.role === "assistant");
+	const hasUserMsg = messages.some(isUserChatMessage);
+	const hasAssistantMsg = messages.some((message) => message.role === "assistant");
 	return hasUserMsg && hasAssistantMsg;
 };
 
@@ -178,9 +190,9 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 		convertToLlm: customConvertToLlm,
 	});
 
-	agentUnsubscribe = agent.subscribe((event: any) => {
-		if (event.type === "state-update") {
-			const messages = event.state.messages;
+	agentUnsubscribe = agent.subscribe((event: AgentEvent) => {
+		if (event.type === "agent_end") {
+			const messages = event.messages;
 
 			// Generate title after first successful response
 			if (!currentTitle && shouldSaveSession(messages)) {
@@ -206,7 +218,12 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 		onApiKeyRequired: async (provider: string) => {
 			return await ApiKeyPromptDialog.prompt(provider);
 		},
-		toolsFactory: (_agent, _agentInterface, _artifactsPanel, runtimeProvidersFactory) => {
+		toolsFactory: (
+			_agent: Agent,
+			_agentInterface: NonNullable<ChatPanel["agentInterface"]>,
+			_artifactsPanel: NonNullable<ChatPanel["artifactsPanel"]>,
+			runtimeProvidersFactory: () => SandboxRuntimeProvider[],
+		) => {
 			// Create javascript_repl tool with access to attachments + artifacts
 			const replTool = createJavaScriptReplTool();
 			replTool.runtimeProvidersFactory = runtimeProvidersFactory;
@@ -264,10 +281,10 @@ const renderApp = () => {
 						children: icon(History, "sm"),
 						onClick: () => {
 							SessionListDialog.open(
-								async (sessionId) => {
+								async (sessionId: string) => {
 									await loadSession(sessionId);
 								},
-								(deletedSessionId) => {
+								(deletedSessionId: string) => {
 									// Only reload if the current session was deleted
 									if (deletedSessionId === currentSessionId) {
 										newSession();
