@@ -289,18 +289,60 @@ function createExtensionAPI(
 	return api;
 }
 
-async function loadExtensionModule(extensionPath: string) {
-	const jiti = createJiti(import.meta.url, {
+type JitiInstance = ReturnType<typeof createJiti>;
+
+function createExtensionJiti(): JitiInstance {
+	return createJiti(import.meta.url, {
+		// Keep module cache disabled so /reload always sees fresh extension code.
+		// jiti async imports can otherwise stay sticky across reloads even with a new
+		// jiti instance, because the underlying ESM loader cache is process-global.
 		moduleCache: false,
 		// In Bun binary: use virtualModules for bundled packages (no filesystem resolution)
 		// Also disable tryNative so jiti handles ALL imports (not just the entry point)
 		// In Node.js/dev: use aliases to resolve to node_modules paths
 		...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
 	});
+}
 
+async function loadExtensionModule(jiti: JitiInstance, extensionPath: string) {
 	const module = await jiti.import(extensionPath, { default: true });
 	const factory = module as ExtensionFactory;
 	return typeof factory !== "function" ? undefined : factory;
+}
+
+async function importExtensionFactories(
+	jiti: JitiInstance,
+	paths: string[],
+	cwd: string,
+): Promise<
+	Array<
+		| { path: string; resolvedPath: string; factory: ExtensionFactory }
+		| { path: string; resolvedPath: string; error: string }
+	>
+> {
+	return Promise.all(
+		paths.map(async (extensionPath) => {
+			const resolvedPath = resolvePath(extensionPath, cwd);
+			try {
+				const factory = await loadExtensionModule(jiti, resolvedPath);
+				if (!factory) {
+					return {
+						path: extensionPath,
+						resolvedPath,
+						error: `Extension does not export a valid factory function: ${extensionPath}`,
+					};
+				}
+				return { path: extensionPath, resolvedPath, factory };
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					path: extensionPath,
+					resolvedPath,
+					error: `Failed to load extension: ${message}`,
+				};
+			}
+		}),
+	);
 }
 
 /**
@@ -326,20 +368,15 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 	};
 }
 
-async function loadExtension(
+async function loadExtensionFromImportedFactory(
 	extensionPath: string,
+	resolvedPath: string,
+	factory: ExtensionFactory,
 	cwd: string,
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd);
-
 	try {
-		const factory = await loadExtensionModule(resolvedPath);
-		if (!factory) {
-			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
-		}
-
 		const extension = createExtension(extensionPath, resolvedPath);
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 		await factory(api);
@@ -375,12 +412,26 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const runtime = createExtensionRuntime();
+	const jiti = createExtensionJiti();
+	const importedFactories = await importExtensionFactories(jiti, paths, cwd);
 
-	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
+	for (const imported of importedFactories) {
+		if ("error" in imported) {
+			errors.push({ path: imported.path, error: imported.error });
+			continue;
+		}
+
+		const { extension, error } = await loadExtensionFromImportedFactory(
+			imported.path,
+			imported.resolvedPath,
+			imported.factory,
+			cwd,
+			resolvedEventBus,
+			runtime,
+		);
 
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push({ path: imported.path, error });
 			continue;
 		}
 
